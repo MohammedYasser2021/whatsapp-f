@@ -6,8 +6,26 @@ import FileUpload from "./components/FileUpload";
 import MessageForm from "./components/MessageForm";
 import StatusIndicator from "./components/StatusIndicator";
 import { API_BASE_URL } from "./config";
-// إضافة إعدادات axios الافتراضية
+
+// Configure axios defaults
 axios.defaults.withCredentials = true;
+axios.defaults.timeout = 30000; // 30 second timeout
+axios.defaults.maxContentLength = 16 * 1024 * 1024; // 16MB max content length
+axios.defaults.maxBodyLength = 16 * 1024 * 1024; // 16MB max body length
+
+// Add retry logic
+axios.interceptors.response.use(undefined, async (err) => {
+  const { config, message } = err;
+  if (!config || !config.retry) {
+    return Promise.reject(err);
+  }
+  config.retry -= 1;
+  if (config.retry === 0) {
+    return Promise.reject(err);
+  }
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  return axios(config);
+});
 
 function App() {
   const [phoneNumbers, setPhoneNumbers] = useState([]);
@@ -18,7 +36,7 @@ function App() {
   const [results, setResults] = useState(null);
   const [hasMedia, setHasMedia] = useState(false);
   const [qrCode, setQrCode] = useState(null);
-  
+  const [progress, setProgress] = useState(0);
 
   useEffect(() => {
     checkStatus();
@@ -61,27 +79,22 @@ function App() {
 
         const numbers = jsonData
           .map((row) => {
-            return (
-              row["Phone Number"] ||
-              row["رقم الهاتف"] ||
-              row["phone"] ||
-              row["Phone"] ||
-              row["الموبايل"] ||
-              row["رقم الموبايل"] ||
-              row["رقم"] ||
-              row["phone number"] ||
-              row["أرقام الهاتف"] ||
-              row["ارقام الهاتف"] ||
-              row["ارقام الهواتف"] ||
-              row["أرقام الهواتف"]
+            const phoneKey = Object.keys(row).find(key => 
+              key.toLowerCase().includes('phone') || 
+              key.includes('هاتف') || 
+              key.includes('موبايل') || 
+              key.includes('رقم')
             );
+            return row[phoneKey];
           })
-          .filter(Boolean);
+          .filter(Boolean)
+          .map(num => num.toString().replace(/\D/g, ''));
 
         setPhoneNumbers(numbers);
         toast.success(`تم تحميل ${numbers.length} رقم`);
       } catch (error) {
         toast.error("حدث خطأ في قراءة الملف");
+        console.error("Excel parsing error:", error);
       }
     };
     reader.readAsBinaryString(file);
@@ -103,6 +116,11 @@ function App() {
             headers: {
               "Content-Type": "multipart/form-data",
             },
+            retry: 3,
+            onUploadProgress: (progressEvent) => {
+              const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+              setProgress(percentCompleted);
+            },
           }
         );
 
@@ -113,9 +131,11 @@ function App() {
       setHasMedia(true);
       toast.success("تم رفع الملفات بنجاح");
     } catch (error) {
-      toast.error("فشل رفع الملفات");
+      toast.error(error.response?.data?.error || "فشل رفع الملفات");
+      console.error("Upload error:", error);
     } finally {
       setIsLoading(false);
+      setProgress(0);
     }
   };
 
@@ -131,6 +151,8 @@ function App() {
     }
 
     setIsLoading(true);
+    let currentProgress = 0;
+
     try {
       const payload = {
         numbers: phoneNumbers,
@@ -140,11 +162,20 @@ function App() {
 
       const response = await axios.post(
         `${API_BASE_URL}/send-bulk-messages`,
-        payload
+        payload,
+        {
+          retry: 3,
+          timeout: 300000, // 5 minutes timeout for bulk sending
+          onUploadProgress: (progressEvent) => {
+            const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+            currentProgress = percentCompleted;
+            setProgress(percentCompleted);
+          },
+        }
       );
-      setResults(response.data.results);
-      console.log("Response data:", response.data.results);
 
+      setResults(response.data.results);
+      
       const successCount = response.data.results.success.length;
       const failedCount = response.data.results.failed.length;
 
@@ -152,10 +183,14 @@ function App() {
         `تم الإرسال بنجاح إلى ${successCount} رقم، وفشل الإرسال إلى ${failedCount} رقم`
       );
     } catch (error) {
-      toast.error("حدث خطأ في عملية الإرسال");
-      console.error("Error details:", error);
+      console.error("Send error:", error);
+      toast.error(
+        error.response?.data?.error || 
+        "حدث خطأ في عملية الإرسال. يرجى المحاولة مرة أخرى"
+      );
     } finally {
       setIsLoading(false);
+      setProgress(0);
     }
   };
 
@@ -174,11 +209,14 @@ function App() {
           results={results}
           qrCode={qrCode}
           onDisconnect={handleDisconnect}
+          progress={progress}
         />
 
         <FileUpload
           onExcelUpload={handleExcelUpload}
           onMediaUpload={handleMediaUpload}
+          isLoading={isLoading}
+          progress={progress}
         />
 
         <MessageForm
@@ -187,6 +225,7 @@ function App() {
           onSend={sendMessages}
           isLoading={isLoading}
           hasMedia={hasMedia}
+          progress={progress}
         />
       </div>
     </div>
