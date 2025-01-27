@@ -6,6 +6,8 @@ import FileUpload from "./components/FileUpload";
 import MessageForm from "./components/MessageForm";
 import StatusIndicator from "./components/StatusIndicator";
 import { API_BASE_URL } from "./config";
+// إضافة إعدادات axios الافتراضية
+axios.defaults.withCredentials = true;
 
 function App() {
   const [phoneNumbers, setPhoneNumbers] = useState([]);
@@ -16,6 +18,7 @@ function App() {
   const [results, setResults] = useState(null);
   const [hasMedia, setHasMedia] = useState(false);
   const [qrCode, setQrCode] = useState(null);
+  
 
   useEffect(() => {
     checkStatus();
