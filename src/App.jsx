@@ -15,36 +15,69 @@ const api = axios.create({
   maxContentLength: 16 * 1024 * 1024,
   maxBodyLength: 16 * 1024 * 1024,
   headers: {
-    'X-Protocol': 'HTTP/1.1',
-    'Connection': 'keep-alive',
-    'Keep-Alive': 'timeout=600'
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
   }
 });
 
-// Add request interceptor
-api.interceptors.request.use(config => {
-  config.headers['X-Requested-With'] = 'XMLHttpRequest';
-  config.headers['Cache-Control'] = 'no-cache';
-  return config;
-});
+// Add request interceptor for detailed logging
+api.interceptors.request.use(
+  config => {
+    console.log('Request:', {
+      url: config.url,
+      method: config.method,
+      headers: config.headers,
+      data: config.data
+    });
+    return config;
+  },
+  error => {
+    console.error('Request Error:', error);
+    return Promise.reject(error);
+  }
+);
 
-// Add response interceptor with retry logic
+// Add response interceptor with retry logic and detailed logging
 api.interceptors.response.use(
-  response => response,
+  response => {
+    console.log('Response:', {
+      status: response.status,
+      headers: response.headers,
+      data: response.data
+    });
+    return response;
+  },
   async error => {
-    const { config } = error;
+    console.error('Response Error:', {
+      message: error.message,
+      code: error.code,
+      response: error.response?.data,
+      status: error.response?.status,
+      headers: error.response?.headers
+    });
+
+    const { config, message } = error;
+    
     if (!config || !config.retry) {
       return Promise.reject(error);
     }
 
-    config.retry -= 1;
-    if (config.retry === 0) {
-      return Promise.reject(error);
+    // Retry only on network errors or 5xx responses
+    if (!error.response || (error.response.status >= 500 && error.response.status <= 599)) {
+      config.retry -= 1;
+      
+      if (config.retry === 0) {
+        return Promise.reject(error);
+      }
+
+      const backoffDelay = Math.min(1000 * (2 ** (3 - config.retry)), 10000);
+      console.log(`Retrying request after ${backoffDelay}ms...`);
+      
+      await new Promise(resolve => setTimeout(resolve, backoffDelay));
+      return api(config);
     }
 
-    // Wait before retrying
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    return api(config);
+    return Promise.reject(error);
   }
 );
 
@@ -67,11 +100,17 @@ function App() {
 
   const checkStatus = async () => {
     try {
-      const response = await api.get('/status');
+      const response = await api.get('/status', {
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache'
+        }
+      });
       setStatus(response.data.status);
       setQrCode(response.data.qrCode);
     } catch (error) {
-      console.error("Error checking status:", error);
+      console.error("Status check error:", error);
+      // Don't update status on error to maintain last known good state
     }
   };
 
@@ -85,6 +124,7 @@ function App() {
       setMediaFiles([]);
       setHasMedia(false);
     } catch (error) {
+      console.error("Disconnect error:", error);
       toast.error("حدث خطأ أثناء قطع الاتصال");
     }
   };
@@ -114,8 +154,8 @@ function App() {
         setPhoneNumbers(numbers);
         toast.success(`تم تحميل ${numbers.length} رقم`);
       } catch (error) {
-        toast.error("حدث خطأ في قراءة الملف");
         console.error("Excel parsing error:", error);
+        toast.error("حدث خطأ في قراءة الملف");
       }
     };
     reader.readAsBinaryString(file);
@@ -142,14 +182,15 @@ function App() {
         });
 
         uploadedFiles.push(response.data.filePath);
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Delay between uploads
       }
 
       setMediaFiles(uploadedFiles);
       setHasMedia(true);
       toast.success("تم رفع الملفات بنجاح");
     } catch (error) {
-      toast.error(error.response?.data?.error || "فشل رفع الملفات");
       console.error("Upload error:", error);
+      toast.error(error.response?.data?.error || "فشل رفع الملفات");
     } finally {
       setIsLoading(false);
       setProgress(0);
@@ -170,44 +211,61 @@ function App() {
     setIsLoading(true);
 
     try {
-      // Split numbers into smaller chunks
-      const chunkSize = 5;
+      // First, verify WhatsApp connection
+      const statusResponse = await api.get('/status');
+      if (statusResponse.data.status !== 'connected') {
+        toast.error("يرجى التأكد من اتصال واتساب أولاً");
+        setIsLoading(false);
+        return;
+      }
+
+      // Process in very small chunks with longer delays
+      const chunkSize = 2; // Send only 2 numbers at a time
       const chunks = [];
       for (let i = 0; i < phoneNumbers.length; i += chunkSize) {
         chunks.push(phoneNumbers.slice(i, i + chunkSize));
       }
 
       const allResults = { success: [], failed: [] };
+      let completedCount = 0;
 
-      // Process each chunk
       for (const chunk of chunks) {
-        const payload = {
-          numbers: chunk,
-          message: message || undefined,
-          mediaPaths: mediaFiles,
-        };
-
         try {
+          const payload = {
+            numbers: chunk,
+            message: message || undefined,
+            mediaPaths: mediaFiles,
+          };
+
+          console.log('Sending chunk:', payload);
+
           const response = await api.post('/send-bulk-messages', payload, {
             retry: 3,
-            timeout: 300000,
-            onUploadProgress: (progressEvent) => {
-              const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-              setProgress(percentCompleted);
-            },
+            timeout: 120000, // 2 minutes per chunk
+            headers: {
+              'Content-Type': 'application/json'
+            }
           });
 
-          allResults.success.push(...response.data.results.success);
-          allResults.failed.push(...response.data.results.failed);
+          if (response.data.results) {
+            allResults.success.push(...response.data.results.success);
+            allResults.failed.push(...response.data.results.failed);
+          }
 
-          // Add delay between chunks
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          completedCount += chunk.length;
+          setProgress(Math.round((completedCount / phoneNumbers.length) * 100));
+
+          // Add a longer delay between chunks
+          await new Promise(resolve => setTimeout(resolve, 5000));
         } catch (error) {
-          // If chunk fails, add all numbers to failed
+          console.error('Chunk error:', error);
           allResults.failed.push(...chunk.map(number => ({
             number,
-            reason: "فشل في الإرسال"
+            reason: error.response?.data?.error || "فشل في الإرسال"
           })));
+          
+          // Add an even longer delay after an error
+          await new Promise(resolve => setTimeout(resolve, 10000));
         }
       }
 
@@ -221,7 +279,10 @@ function App() {
       );
     } catch (error) {
       console.error("Send error:", error);
-      toast.error("حدث خطأ في عملية الإرسال. يرجى المحاولة مرة أخرى");
+      toast.error(
+        error.response?.data?.error || 
+        "حدث خطأ في عملية الإرسال. يرجى المحاولة مرة أخرى"
+      );
     } finally {
       setIsLoading(false);
       setProgress(0);
