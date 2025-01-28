@@ -9,21 +9,30 @@ import { API_BASE_URL } from "./config";
 
 // Configure axios defaults
 axios.defaults.withCredentials = true;
-axios.defaults.timeout = 30000; // 30 second timeout
+axios.defaults.timeout = 300000; // 5 minute timeout
 axios.defaults.maxContentLength = 16 * 1024 * 1024; // 16MB max content length
 axios.defaults.maxBodyLength = 16 * 1024 * 1024; // 16MB max body length
+axios.defaults.headers.common['X-Protocol'] = 'HTTP/1.1'; // Force HTTP/1.1
 
-// Add retry logic
+// Add retry logic with exponential backoff
 axios.interceptors.response.use(undefined, async (err) => {
   const { config, message } = err;
   if (!config || !config.retry) {
     return Promise.reject(err);
   }
+  
+  // Implement exponential backoff
+  const backoffDelay = Math.min(1000 * (2 ** (3 - config.retry)), 10000);
   config.retry -= 1;
+  
   if (config.retry === 0) {
     return Promise.reject(err);
   }
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  
+  // Wait for backoff delay
+  await new Promise(resolve => setTimeout(resolve, backoffDelay));
+  
+  // Retry request
   return axios(config);
 });
 
@@ -37,16 +46,27 @@ function App() {
   const [hasMedia, setHasMedia] = useState(false);
   const [qrCode, setQrCode] = useState(null);
   const [progress, setProgress] = useState(0);
+  const [abortController, setAbortController] = useState(null);
 
   useEffect(() => {
     checkStatus();
     const interval = setInterval(checkStatus, 5000);
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      if (abortController) {
+        abortController.abort();
+      }
+    };
   }, []);
 
   const checkStatus = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/status`);
+      const response = await axios.get(`${API_BASE_URL}/status`, {
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache'
+        }
+      });
       setStatus(response.data.status);
       setQrCode(response.data.qrCode);
     } catch (error) {
@@ -56,6 +76,9 @@ function App() {
 
   const handleDisconnect = async () => {
     try {
+      if (abortController) {
+        abortController.abort();
+      }
       await axios.post(`${API_BASE_URL}/disconnect`);
       toast.success("تم قطع الاتصال بنجاح");
       setResults(null);
@@ -109,6 +132,9 @@ function App() {
         const formData = new FormData();
         formData.append("media", files[i]);
 
+        const controller = new AbortController();
+        setAbortController(controller);
+
         const response = await axios.post(
           `${API_BASE_URL}/upload-media`,
           formData,
@@ -116,6 +142,7 @@ function App() {
             headers: {
               "Content-Type": "multipart/form-data",
             },
+            signal: controller.signal,
             retry: 3,
             onUploadProgress: (progressEvent) => {
               const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
@@ -131,11 +158,16 @@ function App() {
       setHasMedia(true);
       toast.success("تم رفع الملفات بنجاح");
     } catch (error) {
-      toast.error(error.response?.data?.error || "فشل رفع الملفات");
-      console.error("Upload error:", error);
+      if (axios.isCancel(error)) {
+        toast.error("تم إلغاء رفع الملفات");
+      } else {
+        toast.error(error.response?.data?.error || "فشل رفع الملفات");
+        console.error("Upload error:", error);
+      }
     } finally {
       setIsLoading(false);
       setProgress(0);
+      setAbortController(null);
     }
   };
 
@@ -151,9 +183,11 @@ function App() {
     }
 
     setIsLoading(true);
-    let currentProgress = 0;
 
     try {
+      const controller = new AbortController();
+      setAbortController(controller);
+
       const payload = {
         numbers: phoneNumbers,
         message: message || undefined,
@@ -164,11 +198,15 @@ function App() {
         `${API_BASE_URL}/send-bulk-messages`,
         payload,
         {
+          signal: controller.signal,
           retry: 3,
-          timeout: 300000, // 5 minutes timeout for bulk sending
+          timeout: 300000, // 5 minutes timeout
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Protocol': 'HTTP/1.1'
+          },
           onUploadProgress: (progressEvent) => {
             const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-            currentProgress = percentCompleted;
             setProgress(percentCompleted);
           },
         }
@@ -183,14 +221,19 @@ function App() {
         `تم الإرسال بنجاح إلى ${successCount} رقم، وفشل الإرسال إلى ${failedCount} رقم`
       );
     } catch (error) {
-      console.error("Send error:", error);
-      toast.error(
-        error.response?.data?.error || 
-        "حدث خطأ في عملية الإرسال. يرجى المحاولة مرة أخرى"
-      );
+      if (axios.isCancel(error)) {
+        toast.error("تم إلغاء عملية الإرسال");
+      } else {
+        console.error("Send error:", error);
+        toast.error(
+          error.response?.data?.error || 
+          "حدث خطأ في عملية الإرسال. يرجى المحاولة مرة أخرى"
+        );
+      }
     } finally {
       setIsLoading(false);
       setProgress(0);
+      setAbortController(null);
     }
   };
 
